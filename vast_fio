@@ -1,0 +1,175 @@
+#!/bin/bash
+
+### vast_fio  -- a streaming largefile write test
+###    this is supposed to be a short and simple version 
+###    using 64GB files, and varying IO blocksizes, and mixes of read/write
+###
+###    rmallory Thu Sep 12 01:46:11 UTC 2019 version 0.5  .. this is still rough
+###    License:  GPL3 and beer-ware license
+
+###
+### Notes:
+###  needs to be run from a trusted host who has ssh keys
+###  needs NOT to be run as root
+###  will try to start the client daemons
+###  we run directio in this test, large reads perform better in NFS that way.
+
+####  mount example:  10.100.0.22:/mnt/vast on /mnt/io500 type nfs (rw,relatime,vers=3,rsize=131072,wsize=131072,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,mountaddr=10.100.0.240,mountvers=3,mountport=802,mountproto=tcp,local_lock=none,addr=10.100.0.240)
+###  todo:   ssh to each PBS_HOST and get tcp retrans counter and do the math at end
+###          support multiple mountpoints per client 
+###  todo for larger version of this script:
+###          easily changeup mount options, eg: proto=rdma
+###          add nfsiostat client collectors watchdog
+###          feedback to graphite, grafana, slack, etc.
+
+DATE=`date +%m.%d.%Y`
+DATE_TIME=`date +%d.%m.%Y_%H.%M.%S`
+
+#
+FIO=/usr/bin/fio
+FIO=/pkg/trmb/bin/fio 
+test -x $FIO || FIO=/usr/bin/fio
+DAEMON="$FIO --server --daemonize=/tmp/fio.pid"
+
+## Change the next three for sure. 
+export TESTDIR=/mnt/io500
+BASEDIR="$TESTDIR/vastdata/vast_fio"
+PBS_NODEFILE="$BASEDIR/hosts"
+
+df -k -t nfs $TESTDIR || echo "$TESTDIR not mounted.. exiting"
+df -k -t nfs $TESTDIR || exit 
+
+# OK, TESTDIR is in nfs, lets mkdir
+mkdir -p $BASEDIR
+
+export _test=randrw
+export OUTDIR="$BASEDIR/$DATE"
+export OUTPUTDIR_BWLOG="$BASEDIR/$DATE/bwlog"
+
+# twiddle some knobs if you like.
+blocksizes="1m 256k"
+blocksizes="1m"
+qty_hosts="32 16 2 1"
+qty_hosts="16 2 1"
+
+### Function to update blocksize in config file
+update_bs() {
+    _fname=$1
+    _bs=$2
+ 
+    sed -i -e "s/BLOCK_SIZE/$_bs/" $_fname
+}
+ 
+reset_bs(){
+    _fname=$1
+ 
+    sed -i -e 's/^bs=.*/bs=BLOCK_SIZE/' $_fname
+}
+
+
+ 
+### FIO in client/server mode needs a common input file
+create_input_cfg() {
+    _write=$1
+    _read=$2
+    _fname=$3
+    _tname=$4
+ 
+### Create the FIO config file that is shared by all clients.
+    cat >> $_fname << EOF
+[global]
+name=fio-${_tname}-${_write}.${_read}
+bs=BLOCK_SIZE
+rw=$_test
+direct=1
+rwmixwrite=$_write
+rwmixread=$_read
+ioengine=libaio
+iodepth=16
+create_fsync=1
+per_job_logs=1
+thread=10
+nr_files=1
+size=64g
+unlink_each_loop=1
+unlink=1
+ 
+[test1]
+directory=$TESTDIR
+EOF
+}
+
+after=0 
+verify_retrans() {
+    mnt=$1
+    for i in $(cat $PBS_NODEFILE);do
+            RETRANS=$(ssh $i cat /proc/net/snmp | grep -A1 Segs  | tail -1  | awk '{print $(NF-2)}')
+            TOTAL_RETRANS=$((TOTAL_RETRANS+$RETRANS))
+            echo -- checking tcp retransmissions $i = $RETRANS --
+    done
+    if [ $after -lt 1 ] ; then BEFORE_RETRANS=$TOTAL_RETRANS ; fi
+    if [ $after -eq 1 ] ; then AFTER_RETRANS=$((TOTAL_RETRANS - $BEFORE_RETRANS)) ; fi
+    after=1
+    echo "retrans:$RETRANS  total_retrans:$TOTAL_RETRANS before:$BEFORE_RETRANS after: $AFTER_RETRANS"
+}
+
+daemon_fio() {
+    for i in $(cat $PBS_NODEFILE);do
+            echo -- checking for fio server daemon $i --
+            #RUNNING=$(ssh $i "ps -e -o command  | grep $DAEMON)"
+            ssh $i "ps -e -o command  | grep fio | grep -v grep | grep daemon"
+            ssh $i $DAEMON
+    done
+}
+ 
+verify_mount() {
+    mnt=$1
+    for i in $(cat $PBS_NODEFILE);do
+            echo -- checking mnt verify $i --
+            ssh $i "cd $mnt "
+    done
+}
+ 
+run () {
+    input_file=$1
+    for ncpus in $qty_hosts ;do
+        echo "Running a test iteration on UP TO $ncpus hosts"
+        [[ ! -e $OUTDIR ]] && mkdir -p $OUTDIR
+        nodes=`head -$ncpus $PBS_NODEFILE`
+        for bs in $blocksizes ;do
+            update_bs $BASEDIR/$input_file $bs
+            echo ----- STARTING TEST $input_file bs=$bs ncpus=$ncpus `date` -----
+            cmd="$FIO --output ${OUTDIR}/${input_file}.${ncpus}.${bs}.out "
+            infile=$BASEDIR/$input_file
+            for node in $nodes;do
+                cmd=$cmd" --client=$node $infile "
+            done #i
+            df -h $TESTDIR/.
+            echo "running CMD= $cmd"
+            eval $cmd
+            df -h $TESTDIR/.
+exit
+            reset_bs $input_file
+            sleep 10
+        done #bs
+done | tee $BASEDIR/vast_fio.${DATE_TIME}..stdout #ncpu
+}
+
+
+#### functions above, MAIN start of program below
+ 
+[[ ! -e $BASEDIR ]] && echo "Error no $BASEDIR" && exit
+
+# Make sure all the nodes have TESTDIR mounted 
+verify_mount $TESTDIR
+verify_retrans
+daemon_fio
+
+cd $BASEDIR
+rm *.input
+#create inputfiles
+create_input_cfg 100 0 rw.100.0.input sequential
+run rw.100.0.input
+ 
+create_input_cfg 0 100 rw.0.100.input sequential
+run rw.0.100.input
