@@ -1,0 +1,121 @@
+#!/bin/bash
+# 
+# cnode_mount_and_fio -- a script to smoketest performance on a cluster using
+# the existing cnodes. 
+# rmallory  Mon Aug 12 19:29:10 PDT 2019
+#           Thu Sep  5 19:38:34 GMT 2019 -- cosmetic changes, added tee to $LOG
+# we use directio to not fill up the buffercache.
+# please fill in your observed performance results in these comments in this script.
+##  se-perf-2.0.1    qlc, tcp, 1x1    500MB/host writes,  1GB/sec reads
+
+VIPS=/tmp/vips.$$
+MYIP=$(ifconfig bond0.69:m | grep inet | awk '{print $2}')
+
+test -w /etc/passwd && echo "Must not run as root.. this script calls sudo"
+test -w /etc/passwd && exit
+
+clush -a '/usr/sbin/ifconfig -a | grep -A1 vip | tail -1' > $VIPS
+
+awk '{print $1,$3}' $VIPS | tr -d : > ${VIPS}.new   && mv ${VIPS}.new ${VIPS}
+rm -f /tmp/fio_clients
+
+LOG=$HOME/cnode_mount_and_fio.out
+date | tee -a $LOG
+echo "Starting $0 at above time to validate sanity. appending to log: $LOG" | tee -a $LOG
+
+NUMCNODES=$(wc -l ${VIPS} | awk '{print $1}')
+echo NUMCNODES=$NUMCNODES
+
+# Notice this is hardcoded to use the internal IP addresses.
+# the loop below makes sure that each client mounts something other than itself.
+# and yes, we only mount one of the vips because of the tail -1 above.
+for ((CNODE=1;CNODE<=NUMCNODES;CNODE++))
+  do  
+        POSITION=$(grep -n 172.16.3.${CNODE} $VIPS | cut -d: -f1)
+        if [ $POSITION = 4 ] ; then  POSITION=0 ; fi
+        POSITION=$((POSITION+1))
+        NEXT=$( awk '{ if (NR==n) print $0 }' n=$POSITION ${VIPS} | awk '{print $NF}')
+set -x 
+        ssh 172.16.3.$CNODE sudo mkdir -p /mnt/v 
+        ssh 172.16.3.$CNODE sudo mount ${NEXT}:/ /mnt/v
+set +x
+        echo 172.16.3.$CNODE >> /tmp/fio_clients
+  done
+
+#########
+cat >/tmp/fio.writes <<EOF
+; fio-seq-write.job for fiotest
+
+[global]
+name=fio-seq-write
+filename=fio-seq-write
+rw=write
+bs=1mb
+direct=1
+numjobs=8
+time_based=1
+runtime=60
+fallocate=none
+directory=/mnt/v/smoketest
+group_reporting=1
+per_job_logs=1
+log_avg_msec=1000
+buffer_compress_percentage=50
+write_bw_log=fio-test
+write_iops_log=fio-test
+write_lat_log=fio-test
+
+
+[file1]
+size=10G
+ioengine=libaio
+iodepth=16
+
+EOF
+
+cat >/tmp/fio.reads<<EOF
+; fio-seq-read.job for fiotest
+
+[global]
+name=fio-seq-read
+filename=fio-seq-write
+rw=read
+bs=1mb
+direct=1
+numjobs=8
+time_based=1
+runtime=60
+fallocate=none
+directory=/mnt/v/smoketest
+group_reporting=1
+
+[file1]
+size=10G
+ioengine=libaio
+iodepth=16
+
+EOF
+
+sleep 5
+
+df -t nfs /mnt/v || echo "/mnt/v not mounted.. exiting"
+df -t nfs /mnt/v || exit
+
+# This script could use some more seatbelts.
+set -x
+mkdir -p /mnt/v/smoketest
+
+clush -g cnodes '/usr/bin/fio --server  --daemonize=/tmp/fio.pid'
+/usr/bin/fio --client=/tmp/fio_clients /tmp/fio.writes | tee -a $LOG
+sleep 10 
+/usr/bin/fio --client=/tmp/fio_clients /tmp/fio.reads  | tee -a $LOG
+
+# We should copy the log to a place where we can get it via supportbundle
+
+clush -g cnodes pkill fio 
+sleep 5
+clush -g cnodes 'sudo umount /mnt/v'
+clush -g cnodes 'df -k -t nfs /mnt/v && echo STILL MOUNTED .. please investigate'
+set +x
+
+
