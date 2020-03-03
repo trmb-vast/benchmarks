@@ -1,0 +1,239 @@
+#!/bin/bash
+# 
+# cnode_smoketest -- a simpler script to smoketest performance on a cluster using
+# the existing VAST cnodes. because of the contention, and also lack of RDMA
+# from the base OS, this internal test will show at most 80 or 90% of the 
+# true potential of real-world testing from outside the cluster and NFSoRDMA
+#
+# rmallory  rob@vastdata.com
+#           Wed Jan  8 22:16:18 EST 2020 -- @buffalo beef on weck tweaks
+#           Fri Jan 10 22:32:48 UTC 2020 -- @san soho, total rewrrite
+#           Fri Jan 24 00:24:46 UTC 2020 -- @sko , confirmation from alon about ISL
+#           Mon Jan 27 18:48:47 UTC 2020 -- added andys interface prefs static routes
+#
+# we use directio to not fill up the buffercache and give storage perspective stats
+# Notes: currently, half of the procs run at half-rate. suspect numa or ISL overload (fixed)
+#        this script should scale nicely out to a 12x12 system or larger. 
+#
+
+#  The below variables make a combination which fits your application
+#IOSIZE=32k
+IOSIZE=1m
+
+NUMJOBS=2
+NUMJOBS=4
+NUMJOBS=8
+#NUMJOBS=10
+
+# you normally run just one.. 
+# below is 4, and that will mount the subsequent cnodes vips
+LOOPS="1 2 3 4"
+LOOPS="1"
+
+
+IODEPTH=8
+SIZE=10g
+
+
+# This needs to be set to true if VIPOFFSET > 0  else half the traffic goes across ISL as seen with:  show interfaces port-channel
+DO_ROUTES=true
+DO_ROUTES=false
+
+### This lets you chose to loopback mount the current cnode, or the next one up to exercise the network
+### 0 means loopback mount my own vips
+VIPOFFSET=0
+#VIPOFFSET=1
+
+# This is a micro-optimization and can change depending on VAST version.
+# leave blank, or ask Rob about it.
+CPUS_ALLOWED=0,1,2,3,32,33,34,35
+CPUS_ALLOWED=23,24,25,26,27,28,29,30
+CPUS_ALLOWED=54,55,56,57,58,59,60,61
+CPUS_ALLOWED=38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53
+CPUS_ALLOWED=38
+CPUS_ALLOWED=36,37
+# This seems to be unused at the moment on cascadelake cnodes
+CPUS_ALLOWED=37
+CPUFLAGS="--cpus_allowed=$CPUS_ALLOWED"
+CPUFLAGS=""
+
+## Don't change any variables below.
+
+VIPS=/tmp/vips.$$
+U=$VIPS
+mVIP=`cat /vast/vman/mgmt-vip`
+test -r $HOME/.ssh/admin_pass.txt || echo "you need to put the admin password in $HOME/.ssh/admin_pass.txt or in this script"
+test -r $HOME/.ssh/admin_pass.txt || exit
+ADMINPASS=$(cat $HOME/.ssh/admin_pass.txt)
+
+### Go get the vip list
+/usr/bin/curl -s -u admin:${ADMINPASS} -H "accept: application/json" --insecure -X GET "https://$mVIP/api/vips/"  | grep -Po '(?<="id").*(?=cluster)' | sed 's/"id"//g' | sed 's/},{/\n/g' | awk -F, '{print $6 $8}' | awk -F\" '{print $4" " $8}' | grep -v '^.$' > ${VIPS}
+
+### Figure out how many vips per cnode there are
+cat ${VIPS} | tr '-' ' ' | sort -n -k3
+
+NUM=$(wc -l ${VIPS}| awk '{print $1}')
+FIRST=$(head -1 $U | awk '{print $NF}')
+PER=$(grep $FIRST $U | wc -l | awk '{print $1}')
+CNODES=$(($NUM / $PER))
+echo "Found: $CNODES  Cnodes with $PER ip addrs each"
+
+ALL_CNODES=$(clush -g cnodes uname -n  2>&1 | awk '{print $1}' | tr -d : | cut -d. -f4 | sort -n |tr '\n' ' ')
+
+sleep 2
+
+##########################################################
+############ Setup the static route if needed (from andy)
+#an attempt to try and temporarily setup the routing table to ensure that reads/writes go over both ifaces.  
+#It aboslutely improves TPUT on a large system, else half will be using the IPL ports
+#
+#first, figure out what ifaces we need to use.
+export EXT_IFACES=$(cat /etc/vast-configure_network.py-params.ini|grep external|awk -F "=" {'print $2'}| sed -E 's/,/ /')
+# we only care if there are more than one iface.
+export iface_count=`echo $EXT_IFACES | wc -w`
+
+###if you really want to use this logic, change the `3` to a `2` on the next line, and also in the route deletion block at the end of this script.
+if [ $iface_count -eq 2  -a "$DO_ROUTES" = "true" ] ; then
+  #so...this gets complicated.  sometimes the route is OK, sometimes its not, so we have to check them all and only change if they are 'wrong'
+  for iface in $EXT_IFACES
+    do IPS_TO_ROUTE=$(clush -g cnodes "/sbin/ip a s ${iface} | grep vip|egrep -o '[0-9]{1,3}*\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}'"|awk {'print $2'})
+    #now that we have them all, check what the route looks like on this node for each ip.
+    for IP in ${IPS_TO_ROUTE}
+      do current_route=`/sbin/ip route get ${IP}|egrep -o 'dev \w+'|awk {'print $2'}`
+      if [[ ${current_route} == $iface ]] ; then
+        echo "route is OK for $IP -> $iface , skipping"
+      else
+        echo "fixing route for $IP -> $iface"
+        clush -g cnodes sudo /sbin/ip route add ${IP}/32 dev ${iface}
+        #sudo /sbin/ip route add ${IP}/32 dev ${iface}
+      fi
+    done
+  done
+else
+  echo "only one external iface, skipping route setup"
+fi
+
+
+#####################################################################
+### Main loop
+
+# Hmm.. when mounting other cnodes, even us and them same time, tput goes down.
+# so we just mount our local vips and we seem to get max perf.
+for TWO in $LOOPS
+do
+
+for ((x=1;x<=$((CNODES));x+=1))
+do
+# here we pick the mounts from this cnode, or the next cnode, or next..
+  y=$((x+VIPOFFSET)) 
+  if [ $y -gt $CNODES ] ; then y=1 ; fi 
+  #itsvips=$(egrep "cnode-${y}$" ${VIPS} | awk '{print $1}' | tr '\n' ' ')
+  itsvips=$(grep "cnode-${y}$" ${VIPS} | awk '{print $1}' | tr '\n' ' ')
+  z=1
+
+  for i in $itsvips 
+    do 
+
+
+# Setup the mount and then run fio in one ssh
+      mntpt=/mnt/cnode${y}/$z
+      now_epoch=$(date +%s)
+      now_long=$(date)
+      my_hostname=$(uname -n)   
+      set -x
+
+ssh 172.16.3.$x "sudo umount $mntpt >/dev/null 2>&1 ; test -d $mntpt || sudo mkdir -p $mntpt ;sudo mount -o soft,nolock $i:/ $mntpt ;sleep 1 ; mkdir -p $mntpt/${x}/${z} ; (cd $mntpt/${x}/${z} ; echo "starting hostname=$my_hostname  pwd=$mntpt/${x}/${z} mountpoint=$i:/  start_epoch=\$\(date +%s\) " > myfio_out.$$ ; df -t nfs -k $mntpt/${x}/${z}  && nohup /usr/bin/fio --name=rand --ioengine=libaio --fallocate=none --iodepth=$IODEPTH --rw=randrw --bs=$IOSIZE --refill_buffers --randrepeat=0 --numa_mem_policy=local $CPUFLAGS --direct=1 --size=$SIZE --numjobs=$NUMJOBS --rwmixread=100 --group_reporting | tee -a myfio_out.$$ & )" &
+
+      set +x
+#writes
+#/usr/bin/fio --name=rand --ioengine=libaio --fallocate=none --iodepth=16 --rw=randrw --bs=1mb --create_on_open=1 --refill_buffers --randrepeat=0 --direct=1 --size=10g --numjobs=8 --rwmixread=0 --group_reporting
+
+  z=$((z+1))
+    done 
+done
+VIPOFFSET=$((VIPOFFSET+1))
+done
+sleep 2
+
+echo
+echo
+echo '###########################'
+
+clush -g cnodes df -t nfs
+
+echo '###########################'
+
+wait
+
+#####################################################################
+echo "---------------------------------------------"
+echo "Done testing.. now collecting stats"
+echo "---------------------------------------------"
+
+### Run stats on them
+
+MYID=$(ifconfig -a 2>/dev/null | grep 172.16.3 | awk '{print $2}' | cut -d. -f4)
+cnodes=$(cat ${VIPS} | awk '{print $2}' | cut -d- -f2 | sort -un | tr '\n' ' ')
+#for x in $(ifconfig -a 2>/dev/null | grep 172.16.3 | awk '{print $2}' | cut -d. -f4) $cnodes
+
+STATS_MOUNT=$(df -t nfs | tail -1 | awk '{print $NF}')
+
+for num_cnode in $(seq 1 $CNODES)
+do
+for mounts_per in $(seq 1 $PER)
+do
+      mntpt=$STATS_MOUNT/$num_cnode/$mounts_per
+      myfile=$(ls -lrt $mntpt/myfio_* | tail -1 | awk '{print $NF}')
+
+      test -f $myfile || continue
+      mytput=$(grep READ $myfile | awk '{print $3}' | sed -e 's/.*(\(.*\))/\1/' -e 's/MB\/s,//'  ) 
+      wallclock=$(grep READ $myfile | awk '{print $NF}' | sed -e 's/run=.*-\(.*\)$/\1/')
+      start_epoch=$(grep start_epoch $myfile  | grep -oP   'start_epoch=([0-9])*' | cut -d= -f2)
+      end_epoch=$(date +%s)
+      if [ -n "$start_epoch" ] 
+          then runtime=$(($end_epoch-$start_epoch))
+          echo "$(uname -n) mntpt=$mntpt start_epoch=$start_epoch end_epoch=$end_epoch runtime=$wallclock tput=${mytput} MB/s date=$(date)"
+      fi
+done
+done
+
+### Now be sure to unmount all NFS mounts from teh cnodes.
+
+echo "---------------------------------------------"
+echo "Unmounting NFS mounts"
+echo "---------------------------------------------"
+set -x
+
+clush -g cnodes 'sudo umount -t nfs -a'
+STILL=/tmp/still_mounted.$$
+clush -g cnodes 'df -t nfs 2>&1' 2>&1 | grep 'mnt/cnode' > $STILL
+for i in $(cat $STILL | awk '{print $1}')
+  do ssh $i sudo umount -t nfs -a
+done
+
+STILLMORE=/tmp/stillmore_mounted.$$
+clush -g cnodes 'df -t nfs 2>&1' 2>&1 | grep 'mnt/cnode' > $STILLMORE
+for i in $(cat $STILLMORE | awk '{print $1}')
+  do echo ssh $i sudo umount -t nfs -a
+          ssh $i sudo umount -t nfs -a
+done
+set +x
+
+echo "---------------------------------------------"
+echo "Removing any static routes setup by this test"
+echo "---------------------------------------------"
+#####  Another block from Andy.. 
+#get rid of routes...change the `3` to `2` if you used the routing affinity.
+if [ $iface_count -eq 2  -a "$DO_ROUTES" = "true" ] ; then
+  for iface in $EXT_IFACES
+    do export IPS_TO_ROUTE=$(clush -g cnodes "/sbin/ip a s ${iface} | grep vip|egrep -o '[0-9]{1,3}*\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}'"|awk {'print $2'})
+    for IP in ${IPS_TO_ROUTE}
+    # a little heavy handed, but its OK.
+      do   echo "+ clush -g cnodes sudo /sbin/ip route del ${IP}/32 dev ${iface}"
+                clush -g cnodes sudo /sbin/ip route del ${IP}/32 dev ${iface} 2>&1 | egrep -v 'No such process|exited with exit code 2'
+    done
+  done
+else
+  echo "only one external iface, skipping route destruction"
+fi
+
