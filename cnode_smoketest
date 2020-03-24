@@ -33,6 +33,7 @@ LOOPS="1"
 
 IODEPTH=8
 SIZE=10g
+SIZE=1g
 
 
 # This needs to be set to true if VIPOFFSET > 0  else half the traffic goes across ISL as seen with:  show interfaces port-channel
@@ -117,6 +118,14 @@ fi
 #####################################################################
 ### Main loop
 
+clush -g cnodes '/usr/bin/docker ps -q --filter label=role=vms' > /tmp/vms_is_here
+VMSHOST=$(cat /tmp/vms_is_here | cut -d: -f1)
+
+echo done audit
+sleep 10
+
+#######  done audit     #############################################
+
 # Hmm.. when mounting other cnodes, even us and them same time, tput goes down.
 # so we just mount our local vips and we seem to get max perf.
 for TWO in $LOOPS
@@ -140,10 +149,17 @@ do
       now_epoch=$(date +%s)
       now_long=$(date)
       my_hostname=$(uname -n)   
-      set -x
 
-ssh 172.16.3.$x "if [ $(docker ps -q --filter label=role=vms |wc -l) -eq 1 ]; then echo "NOT running on VMS" ; exit ;fi;sudo umount $mntpt >/dev/null 2>&1 ; test -d $mntpt || sudo mkdir -p $mntpt ;sudo mount -o soft,nolock $i:/ $mntpt ;sleep 1 ; mkdir -p $mntpt/${x}/${z} ; (cd $mntpt/${x}/${z} ; echo "starting hostname=$my_hostname  pwd=$mntpt/${x}/${z} mountpoint=$i:/  start_epoch=\$\(date +%s\) " > myfio_out.$$ ; df -t nfs -k $mntpt/${x}/${z}  && nohup /usr/bin/fio --name=rand --ioengine=libaio --fallocate=none --iodepth=$IODEPTH --rw=randrw --bs=$IOSIZE --refill_buffers --randrepeat=0 --numa_mem_policy=local $CPUFLAGS --direct=1 --size=$SIZE --numjobs=$NUMJOBS --rwmixread=100 --group_reporting | tee -a myfio_out.$$ & )" &
-#ssh 172.16.3.$x "sudo umount $mntpt >/dev/null 2>&1 ; test -d $mntpt || sudo mkdir -p $mntpt ;sudo mount -o soft,nolock $i:/ $mntpt ;sleep 1 ; mkdir -p $mntpt/${x}/${z} ; (cd $mntpt/${x}/${z} ; echo "starting hostname=$my_hostname  pwd=$mntpt/${x}/${z} mountpoint=$i:/  start_epoch=\$\(date +%s\) " > myfio_out.$$ ; df -t nfs -k $mntpt/${x}/${z}  && nohup /usr/bin/fio --name=rand --ioengine=libaio --fallocate=none --iodepth=$IODEPTH --rw=randrw --bs=$IOSIZE --refill_buffers --randrepeat=0 --numa_mem_policy=local $CPUFLAGS --direct=1 --size=$SIZE --numjobs=$NUMJOBS --rwmixread=100 --group_reporting | tee -a myfio_out.$$ & )" &
+set -x
+
+### Bail out if we are trying to run on the VMS host.
+if [ "$VMSHOST" = "172.16.3.$x" ] 
+then echo "WARN:  Continuing on.. Not testing on VMS host"
+     continue
+fi
+
+### then run the benchmark
+ssh 172.16.3.$x "sudo umount $mntpt >/dev/null 2>&1 ; test -d $mntpt || sudo mkdir -p $mntpt ;sudo mount -o soft,nolock $i:/ $mntpt ;sleep 1 ; mkdir -p $mntpt/${x}/${z} ; (cd $mntpt/${x}/${z} ; echo "starting hostname=$my_hostname  pwd=$mntpt/${x}/${z} mountpoint=$i:/  start_epoch=\$\(date +%s\) " > myfio_out.$$ ; df -t nfs -k $mntpt/${x}/${z}  && nohup /usr/bin/fio --name=rand --ioengine=libaio --fallocate=none --iodepth=$IODEPTH --rw=randrw --bs=$IOSIZE --refill_buffers --randrepeat=0 --numa_mem_policy=local $CPUFLAGS --direct=1 --size=$SIZE --numjobs=$NUMJOBS --rwmixread=100 --group_reporting | tee -a myfio_out.$$ & )" &
 
       set +x
 #writes
@@ -197,6 +213,13 @@ do
       fi
 done
 done
+
+# audit after 
+rm -f /tmp/arp_en /tmp/ifconfig_a
+clush -g cnodes "/usr/sbin/arp -en" > /tmp/arp_en
+clush -g cnodes "/usr/sbin/ifconfig -a" > /tmp/ifconfig_a
+
+
 
 ### Now be sure to unmount all NFS mounts from teh cnodes.
 
