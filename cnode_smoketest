@@ -1,8 +1,8 @@
 #!/bin/bash
-# 
+#
 # cnode_smoketest -- a simpler script to smoketest performance on a cluster using
 # the existing VAST cnodes. because of the contention, and also lack of RDMA
-# from the base OS, this internal test will show at most 80 or 90% of the 
+# from the base OS, this internal test will show at most 80 or 90% of the
 # true potential of real-world testing from outside the cluster and NFSoRDMA
 #
 # rmallory  rob@vastdata.com
@@ -10,31 +10,38 @@
 #           Fri Jan 10 22:32:48 UTC 2020 -- @san soho, total rewrrite
 #           Fri Jan 24 00:24:46 UTC 2020 -- @sko , confirmation from alon about ISL
 #           Mon Jan 27 18:48:47 UTC 2020 -- added andys interface prefs static routes
+#           Sat Apr 18 16:02:49 UTC 2020 -- added a second ${mntpt}_2 to get max BW
 #
 # we use directio to not fill up the buffercache and give storage perspective stats
 # Notes: currently, half of the procs run at half-rate. suspect numa or ISL overload (fixed)
-#        this script should scale nicely out to a 12x12 system or larger. 
+#        this script should scale nicely out to a 12x12 system or larger.
 #
 
 #  The below variables make a combination which fits your application
 #IOSIZE=32k
 IOSIZE=1m
 
-NUMJOBS=2
-NUMJOBS=4
 NUMJOBS=8
-#NUMJOBS=10
+#NUMJOBS=4
+#NUMJOBS=8
 
-# you normally run just one.. 
-# below is 4, and that will mount the subsequent cnodes vips
-LOOPS="1 2 3 4"
-LOOPS="1"
-
+# you normally run just one..  and with VIPOFFSET=0 it will only mount iteself.
+# if you crank it up to 1 2 3 4 like below , then it
+# that will mount the subsequent cnodes vips and you can go for max-bandwidth
+# but in that case you should DO_ROUTES=true  to keep off the ISL
+#LOOPS="1 2 3 4"
+#LOOPS="1 2 3"
+LOOPS="1 2"
+#LOOPS="1"
 
 IODEPTH=8
-SIZE=10g
-SIZE=1g
+#IODEPTH=12
 
+SIZE=10g
+#SIZE=1g
+# Instead of size based, lets run time based.
+#RUNTIME="--runtime=45s"
+#RUNTIME="--runtime=4m"
 
 # This needs to be set to true if VIPOFFSET > 0  else half the traffic goes across ISL as seen with:  show interfaces port-channel
 DO_ROUTES=true
@@ -44,19 +51,6 @@ DO_ROUTES=false
 ### 0 means loopback mount my own vips
 VIPOFFSET=0
 #VIPOFFSET=1
-
-# This is a micro-optimization and can change depending on VAST version.
-# leave blank, or ask Rob about it.
-CPUS_ALLOWED=0,1,2,3,32,33,34,35
-CPUS_ALLOWED=23,24,25,26,27,28,29,30
-CPUS_ALLOWED=54,55,56,57,58,59,60,61
-CPUS_ALLOWED=38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53
-CPUS_ALLOWED=38
-CPUS_ALLOWED=36,37
-# This seems to be unused at the moment on cascadelake cnodes
-CPUS_ALLOWED=37
-CPUFLAGS="--cpus_allowed=$CPUS_ALLOWED"
-CPUFLAGS=""
 
 ## Don't change any variables below.
 
@@ -68,24 +62,38 @@ test -r $HOME/.ssh/admin_pass.txt || exit
 ADMINPASS=$(cat $HOME/.ssh/admin_pass.txt)
 
 ### Go get the vip list
+/usr/bin/curl -s -u admin:${ADMINPASS} -H "accept: application/json" --insecure -X GET "https://$mVIP/api/vips/"  | grep -Po '(?<="id").*(?=cluster)' | sed 's/"id"//g' | sed 's/},{/\n/g'  | grep -Po '(?<="vippool").*(?=cnode)' | cut -d\" -f2 | sort -u > ${VIPS}_long
+if [ "$(wc -l ${VIPS}_long | awk '{print $1}')" -gt 1 ]
+then
+     echo "Found more than one vippool:  $(cat ${VIPS}_long | tr '\n' ' ')"
+     echo "Choosing the first one: $(head -1 ${VIPS}_long)" ;
+
+     /usr/bin/curl -s -u admin:${ADMINPASS} -H "accept: application/json" --insecure -X GET "https://$mVIP/api/vips/"  | grep -Po '(?<="id").*(?=cluster)' | sed 's/"id"//g' | sed 's/},{/\n/g' | grep $(head -1 ${VIPS}_long) | awk -F, '{print $6 $8}' | awk -F\" '{print $4" " $8}' | grep -v '^.$' > ${VIPS}
+set +x
+else
 /usr/bin/curl -s -u admin:${ADMINPASS} -H "accept: application/json" --insecure -X GET "https://$mVIP/api/vips/"  | grep -Po '(?<="id").*(?=cluster)' | sed 's/"id"//g' | sed 's/},{/\n/g' | awk -F, '{print $6 $8}' | awk -F\" '{print $4" " $8}' | grep -v '^.$' > ${VIPS}
+fi
+
+# pools
+#https://$mVIP/api/vips/?vippool__id=${POOL}
 
 ### Figure out how many vips per cnode there are
 cat ${VIPS} | tr '-' ' ' | sort -n -k3
 
 NUM=$(wc -l ${VIPS}| awk '{print $1}')
-FIRST=$(head -1 $U | awk '{print $NF}')
-PER=$(grep $FIRST $U | wc -l | awk '{print $1}')
+FIRST=$(head -1 $VIPS | awk '{print $NF}')
+PER=$(grep $FIRST $VIPS  | wc -l | awk '{print $1}')
 CNODES=$(($NUM / $PER))
 echo "Found: $CNODES  Cnodes with $PER ip addrs each"
 
 ALL_CNODES=$(clush -g cnodes uname -n  2>&1 | awk '{print $1}' | tr -d : | cut -d. -f4 | sort -n |tr '\n' ' ')
 
+echo VIPS=$VIPS
 sleep 2
 
 ##########################################################
 ############ Setup the static route if needed (from andy)
-#an attempt to try and temporarily setup the routing table to ensure that reads/writes go over both ifaces.  
+#an attempt to try and temporarily setup the routing table to ensure that reads/writes go over both ifaces.
 #It aboslutely improves TPUT on a large system, else half will be using the IPL ports
 #
 #first, figure out what ifaces we need to use.
@@ -113,13 +121,13 @@ if [ $iface_count -eq 2  -a "$DO_ROUTES" = "true" ] ; then
 else
   echo "only one external iface, skipping route setup"
 fi
-
-
 #####################################################################
 ### Main loop
 
 clush -g cnodes '/usr/bin/docker ps -q --filter label=role=vms' > /tmp/vms_is_here
 VMSHOST=$(cat /tmp/vms_is_here | cut -d: -f1)
+echo FOUND VMS RUNNING ON $VMSHOST
+echo FOUND VMS RUNNING ON $VMSHOST
 
 echo done audit
 sleep 10
@@ -130,43 +138,48 @@ sleep 10
 # so we just mount our local vips and we seem to get max perf.
 for TWO in $LOOPS
 do
-
-for ((x=1;x<=$((CNODES));x+=1))
+echo
+for ((x=1;x<$((CNODES+2));x+=1))
 do
 # here we pick the mounts from this cnode, or the next cnode, or next..
-  y=$((x+VIPOFFSET)) 
-  if [ $y -gt $CNODES ] ; then y=1 ; fi 
-  #itsvips=$(egrep "cnode-${y}$" ${VIPS} | awk '{print $1}' | tr '\n' ' ')
+  y=$((x+VIPOFFSET))
+  if [ $y -gt $((CNODES+2)) ] ; then y=1 ; fi
   itsvips=$(grep "cnode-${y}$" ${VIPS} | awk '{print $1}' | tr '\n' ' ')
   z=1
 
-  for i in $itsvips 
-    do 
+  for i in $itsvips
+    do
 
 
 # Setup the mount and then run fio in one ssh
       mntpt=/mnt/cnode${y}/$z
       now_epoch=$(date +%s)
       now_long=$(date)
-      my_hostname=$(uname -n)   
+      my_hostname=$(uname -n)
 
-set -x
 
 ### Bail out if we are trying to run on the VMS host.
-if [ "$VMSHOST" = "172.16.3.$x" ] 
-then echo "WARN:  Continuing on.. Not testing on VMS host"
-     continue
+if [ "$CNODES" -ge 12 ]
+then
+#echo "CHECKING if $VMSHOST = 172.16.3.$x"
+    if [ "$VMSHOST" = "172.16.3.$x" ]
+    then echo "WARN:  Continuing on.. Not testing on VMS host"
+         continue
+    fi
 fi
 
-### then run the benchmark
-ssh 172.16.3.$x "sudo umount $mntpt >/dev/null 2>&1 ; test -d $mntpt || sudo mkdir -p $mntpt ;sudo mount -o soft,nolock $i:/ $mntpt ;sleep 1 ; mkdir -p $mntpt/${x}/${z} ; (cd $mntpt/${x}/${z} ; echo "starting hostname=$my_hostname  pwd=$mntpt/${x}/${z} mountpoint=$i:/  start_epoch=\$\(date +%s\) " > myfio_out.$$ ; df -t nfs -k $mntpt/${x}/${z}  && nohup /usr/bin/fio --name=rand --ioengine=libaio --fallocate=none --iodepth=$IODEPTH --rw=randrw --bs=$IOSIZE --refill_buffers --randrepeat=0 --numa_mem_policy=local $CPUFLAGS --direct=1 --size=$SIZE --numjobs=$NUMJOBS --rwmixread=100 --group_reporting | tee -a myfio_out.$$ & )" &
+### then run the benchmark .. two mounts to my same vip.
+echo "Launching 172.16.3.$x $i $mntpt   "
+
+ssh 172.16.3.$x "sudo umount $mntpt >/dev/null 2>&1 ; test -d $mntpt || sudo mkdir -p $mntpt ;sudo mount -o soft,nolock $i:/ $mntpt ;sleep 1 ; mkdir -p $mntpt/${x}/${z} ; (cd $mntpt/${x}/${z} ; echo "starting hostname=$my_hostname  pwd=$mntpt/${x}/${z} mountpoint=$i:/  start_epoch=\$\(date +%s\) " > myfio_out.$$ ; df -t nfs -k $mntpt/${x}/${z}  && nohup /usr/bin/fio --name=rand --ioengine=libaio --fallocate=none --iodepth=$IODEPTH --rw=randrw --bs=$IOSIZE --size=$SIZE  --refill_buffers --randrepeat=0 --numa_mem_policy=local $CPUFLAGS --direct=1 $RUNTIME --numjobs=$NUMJOBS --rwmixread=100 --group_reporting | tee -a myfio_out.$$ & )" &
+ssh 172.16.3.$x "sudo umount ${mntpt}_2 >/dev/null 2>&1 ; test -d ${mntpt}_2 || sudo mkdir -p ${mntpt}_2 ;sudo mount -o soft,nolock $i:/ ${mntpt}_2 ;sleep 1 ; mkdir -p ${mntpt}_2/${x}/${z}_2 ; (cd ${mntpt}_2/${x}/${z}_2 ; echo "starting hostname=$my_hostname  pwd=${mntpt}_2/${x}/${z}_2 mountpoint=$i:/  start_epoch=\$\(date +%s\) " > myfio_out.$$ ; df -t nfs -k ${mntpt}_2/${x}/${z}_2  && nohup /usr/bin/fio --name=rand --ioengine=libaio --fallocate=none --iodepth=$IODEPTH --rw=randrw --bs=$IOSIZE --size=$SIZE --refill_buffers --randrepeat=0 --numa_mem_policy=local $CPUFLAGS --direct=1 $RUNTIME --numjobs=$NUMJOBS --rwmixread=100 --group_reporting | tee -a myfio_out.$$ & )" &
 
       set +x
 #writes
 #/usr/bin/fio --name=rand --ioengine=libaio --fallocate=none --iodepth=16 --rw=randrw --bs=1mb --create_on_open=1 --refill_buffers --randrepeat=0 --direct=1 --size=10g --numjobs=8 --rwmixread=0 --group_reporting
 
   z=$((z+1))
-    done 
+    done
 done
 VIPOFFSET=$((VIPOFFSET+1))
 done
@@ -193,32 +206,31 @@ MYID=$(ifconfig -a 2>/dev/null | grep 172.16.3 | awk '{print $2}' | cut -d. -f4)
 cnodes=$(cat ${VIPS} | awk '{print $2}' | cut -d- -f2 | sort -un | tr '\n' ' ')
 #for x in $(ifconfig -a 2>/dev/null | grep 172.16.3 | awk '{print $2}' | cut -d. -f4) $cnodes
 
-STATS_MOUNT=$(df -t nfs | tail -1 | awk '{print $NF}')
+#STATS_MOUNT=$(df -t nfs | tail -1 | awk '{print $NF}')
+#
+#for num_cnode in $(seq 1 $CNODES)
+#do
+#for mounts_per in $(seq 1 $PER)
+#do
+#      mntpt=$STATS_MOUNT/$num_cnode/$mounts_per
+#      myfile=$(ls -lrt $mntpt/myfio_* | tail -1 | awk '{print $NF}')
+#
+#      test -f $myfile || continue
+#      mytput=$(grep READ $myfile | awk '{print $3}' | sed -e 's/.*(\(.*\))/\1/' -e 's/MB\/s,//'  )
+#      wallclock=$(grep READ $myfile | awk '{print $NF}' | sed -e 's/run=.*-\(.*\)$/\1/')
+#      start_epoch=$(grep start_epoch $myfile  | grep -oP   'start_epoch=([0-9])*' | cut -d= -f2)
+#      end_epoch=$(date +%s)
+#      if [ -n "$start_epoch" ]
+#          then runtime=$(($end_epoch-$start_epoch))
+#          echo "$(uname -n) mntpt=$mntpt start_epoch=$start_epoch end_epoch=$end_epoch runtime=$wallclock tput=${mytput} MB/s date=$(date)"
+#      fi
+#done
+#done
 
-for num_cnode in $(seq 1 $CNODES)
-do
-for mounts_per in $(seq 1 $PER)
-do
-      mntpt=$STATS_MOUNT/$num_cnode/$mounts_per
-      myfile=$(ls -lrt $mntpt/myfio_* | tail -1 | awk '{print $NF}')
-
-      test -f $myfile || continue
-      mytput=$(grep READ $myfile | awk '{print $3}' | sed -e 's/.*(\(.*\))/\1/' -e 's/MB\/s,//'  ) 
-      wallclock=$(grep READ $myfile | awk '{print $NF}' | sed -e 's/run=.*-\(.*\)$/\1/')
-      start_epoch=$(grep start_epoch $myfile  | grep -oP   'start_epoch=([0-9])*' | cut -d= -f2)
-      end_epoch=$(date +%s)
-      if [ -n "$start_epoch" ] 
-          then runtime=$(($end_epoch-$start_epoch))
-          echo "$(uname -n) mntpt=$mntpt start_epoch=$start_epoch end_epoch=$end_epoch runtime=$wallclock tput=${mytput} MB/s date=$(date)"
-      fi
-done
-done
-
-# audit after 
+# audit after
 rm -f /tmp/arp_en /tmp/ifconfig_a
 clush -g cnodes "/usr/sbin/arp -en" > /tmp/arp_en
 clush -g cnodes "/usr/sbin/ifconfig -a" > /tmp/ifconfig_a
-
 
 
 ### Now be sure to unmount all NFS mounts from teh cnodes.
@@ -246,7 +258,7 @@ set +x
 echo "---------------------------------------------"
 echo "Removing any static routes setup by this test"
 echo "---------------------------------------------"
-#####  Another block from Andy.. 
+#####  Another block from Andy..
 #get rid of routes...change the `3` to `2` if you used the routing affinity.
 if [ $iface_count -eq 2  -a "$DO_ROUTES" = "true" ] ; then
   for iface in $EXT_IFACES
@@ -261,3 +273,5 @@ else
   echo "only one external iface, skipping route destruction"
 fi
 
+#### Doing post processing.. gotta make a mount on this host.
+mount -o soft,nolock $i:/ /smoketest_stats
