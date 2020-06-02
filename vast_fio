@@ -82,7 +82,7 @@ blocksizes="256k"
 # This is the array of how many hosts you want to test with, incrementing or decrementing.
 # if your hostfile has only a couple hosts, but they have multiple interfaces
 # then you can put multiple entries of that host in the hostfile, and it will
-# run this many occurances of that.  
+# run this many occurances of that. the value below just takes the head -n of the PBS_NODEFILE
 qty_hosts="32 16 2 1"
 qty_hosts="16 2 1"
 qty_hosts="1 2 4 8 "
@@ -145,11 +145,14 @@ randrepeat=0
 [test1]
 directory=$TESTDIR
 
-[test2]
-directory=$TESTDIR
-bs=4k
-thread=4
-size=8g
+# Uncomment test2 to make the iops bi-modal, like EDA
+# adjust the params to fit so they finish at the same time
+# ask rob for some even more interesting overlapping tests.
+#[test2]
+#directory=$TESTDIR
+#bs=4k
+#thread=4
+#size=8g
 
 EOF
 }
