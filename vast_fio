@@ -1,43 +1,71 @@
 #!/bin/bash
 
 ### vast_fio  -- a streaming largefile write test
-###    this is supposed to be a short and simple version 
 ###    using 64GB files, and varying IO blocksizes, and mixes of read/write
 ###
-###    rmallory Thu Sep 12 01:46:11 UTC 2019 version 0.5  .. this is still rough
-###    License:  GPL3 and beer-ware license
+###    rmallory Thu Sep 12 01:46:11 UTC 2019 version 0.5 .. this is still rough
+###             Tue Jun  2 00:57:54 UTC 2020 version 0.6 .. updated for multiple mounts
 
 ###
 ### Notes:
-###  needs to be run from a trusted host who has ssh keys
+###  needs fio 3.19+  (with refill_buffers flag)  
+###  wget https://github.com/axboe/fio/archive/fio-3.20.tar.gz
+###  needs to be run from a trusted host who has ssh keys.
 ###  needs NOT to be run as root
-###  will try to start the client daemons
-###  we run directio in this test, large reads perform better in NFS that way.
+###  will try to start the client daemons 
+###  we run directio in this test, random data pattern, large reads perform better in NFS that way.
 
-####  mount example:  10.100.0.22:/mnt/vast on /mnt/io500 type nfs (rw,relatime,vers=3,rsize=131072,wsize=131072,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,mountaddr=10.100.0.240,mountvers=3,mountport=802,mountproto=tcp,local_lock=none,addr=10.100.0.240)
-###  todo:   ssh to each PBS_HOST and get tcp retrans counter and do the math at end
-###          support multiple mountpoints per client 
-###  todo for larger version of this script:
-###          easily changeup mount options, eg: proto=rdma
-###          add nfsiostat client collectors watchdog
-###          feedback to graphite, grafana, slack, etc.
+###  enhancements:   ssh to each PBS_HOST and get tcp retrans counter and do the math at end
+
+####  mount example:  10.100.0.22:/mnt/vast on /mnt/vast type nfs (rw,relatime,vers=3,rsize=131072,wsize=131072,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,mountaddr=10.100.0.240,mountvers=3,mountport=802,mountproto=tcp,local_lock=none,addr=10.100.0.240)
+#### NFSoRDMA example: sudo mount -o rdma,port=20049,intr,nolock,soft 192.168.156.5:imagenet-scratch/robtest /mnt/vast
+####
+#### Note:  you can now have multiple mounts (one for each interface/switch/cnode)  (set TESTDIR below)
+####        but you should optimize performance by being cogniscent of numa/interfaces/switch/cnode-interface
+####        bu utilizing a script which will round-robin IP addresses per cnode-pool, and give a hint to the
+####        client script to make a decision about which nic soas to no promote Inter-switch-link traffic
+
+## Howto:
+##  0) go get and compile a recent version of fio.
+##  1) create your hostlist as setup below. Using multiple entries for same host will send multiple jobs to it.
+##  2) if you have multiple TESTDIRs, seperate them with :colon: and also set numjobs= to be the same as
+##     the quantity of mounts you have per host.
+##  3) craft a smart mount script, as mentioned above, and mount all TESTDIRs on each client in the PBS_NODEFILE
+##  4) the fio commandline may get over 1024 length and blow up the shell.. if so, then we can probably split
+##     up seperate PBS_NODEFILEs  and directories to test in(TESTDIR), and then run multiple instances of this.
 
 DATE=`date +%m.%d.%Y`
 DATE_TIME=`date +%d.%m.%Y_%H.%M.%S`
 
-#
+# This needs to be set to fio version 3.19 or greater
 FIO=/usr/bin/fio
 FIO=/pkg/trmb/bin/fio 
-test -x $FIO || FIO=/usr/bin/fio
+FIO=/usr/local/bin/fio
+
 DAEMON="$FIO --server --daemonize=/tmp/fio.pid"
 
+########################################################
 ## Change the next three for sure. 
-export TESTDIR=/mnt/io500
-BASEDIR="$TESTDIR/vastdata/vast_fio"
+
+# Single mount example
+#export TESTDIR=/mnt/vast
+
+# You can have multiple mountpoints used like this, but be sure to match numjobs to this to distibute them.
+# ask rob about a script run on client / server to make good choices for mounts
+export TESTDIR=/ib0/sw0/imagenet-scratch/robtest:/ib1/sw1/imagenet-scratch/robtest:/ib6/sw0/imagenet-scratch/robtest:/ib7/sw1/imagenet-scratch/robtest:/ib2/sw0/imagenet-scratch/robtest:/ib5/sw1/imagenet-scratch/robtest:/ib3/sw1/imagenet-scratch/robtest:/ib4/sw0/imagenet-scratch/robtest
+
+########################################################
+# OK.. so if we have colon-seperated testdirs, then basedir is the first
+BASEDIR="$(echo $TESTDIR | cut -d: -f1)/vastdata/vast_fio"
+
+########################################################
+# You must create/maintain a hosts file here.. 
+# it can have multiple entries for same host in it.
 PBS_NODEFILE="$BASEDIR/hosts"
+########################################################
 
 df -k -t nfs $TESTDIR || echo "$TESTDIR not mounted.. exiting"
-df -k -t nfs $TESTDIR || exit 
+(df -k -t nfs $TESTDIR >/dev/null) || exit 
 
 # OK, TESTDIR is in nfs, lets mkdir
 mkdir -p $BASEDIR
@@ -46,11 +74,24 @@ export _test=randrw
 export OUTDIR="$BASEDIR/$DATE"
 export OUTPUTDIR_BWLOG="$BASEDIR/$DATE/bwlog"
 
-# twiddle some knobs if you like.
-blocksizes="1m 256k"
-blocksizes="1m"
+# twiddle some knobs if you like. we loop through these space seperated lists
+blocksizes="32k 64k 128k 256k 512k 768k 1m"
+blocksizes="256k"
+#blocksizes="1m"
+
+# This is the array of how many hosts you want to test with, incrementing or decrementing.
+# if your hostfile has only a couple hosts, but they have multiple interfaces
+# then you can put multiple entries of that host in the hostfile, and it will
+# run this many occurances of that.  
 qty_hosts="32 16 2 1"
 qty_hosts="16 2 1"
+qty_hosts="1 2 4 8 "
+qty_hosts="10 12 14 16"
+qty_hosts="8"
+
+
+# Example Results:
+#a single DGX2 with 8 EDR/IB interfaces:  256k, TESTDIR=8 directories, qty_hosts=8 (same host) , njobs=8  = 33GB/sec
 
 ### Function to update blocksize in config file
 update_bs() {
@@ -85,17 +126,31 @@ direct=1
 rwmixwrite=$_write
 rwmixread=$_read
 ioengine=libaio
-iodepth=16
+iodepth=4
 create_fsync=1
 per_job_logs=1
-thread=10
+thread=2
 nr_files=1
+numjobs=16
 size=64g
-unlink_each_loop=1
-unlink=1
+#unlink_each_loop=1
+#unlink=1
+startdelay=10
+fsync_on_close=1
+create_on_open=1
+create_serialize=0
+refill_buffers
+randrepeat=0
  
 [test1]
 directory=$TESTDIR
+
+[test2]
+directory=$TESTDIR
+bs=4k
+thread=4
+size=8g
+
 EOF
 }
 
@@ -133,7 +188,6 @@ verify_mount() {
 run () {
     input_file=$1
     for ncpus in $qty_hosts ;do
-        echo "Running a test iteration on UP TO $ncpus hosts"
         [[ ! -e $OUTDIR ]] && mkdir -p $OUTDIR
         nodes=`head -$ncpus $PBS_NODEFILE`
         for bs in $blocksizes ;do
@@ -142,13 +196,13 @@ run () {
             cmd="$FIO --output ${OUTDIR}/${input_file}.${ncpus}.${bs}.out "
             infile=$BASEDIR/$input_file
             for node in $nodes;do
+                #cmd=$cmd" --client=$node $infile "
                 cmd=$cmd" --client=$node $infile "
             done #i
-            df -h $TESTDIR/.
+            #df -h $TESTDIR/.
             echo "running CMD= $cmd"
             eval $cmd
-            df -h $TESTDIR/.
-exit
+            #df -h $TESTDIR/.
             reset_bs $input_file
             sleep 10
         done #bs
@@ -167,9 +221,22 @@ daemon_fio
 
 cd $BASEDIR
 rm *.input
-#create inputfiles
-create_input_cfg 100 0 rw.100.0.input sequential
-run rw.100.0.input
- 
+
+### Uncomment as many as you like below...
+##create inputfiles
+## 100 0 means 100% writes,  0% reads
+##  100% Write test
+#create_input_cfg 100 0 rw.100.0.input sequential
+#run rw.100.0.input
+
+##  100% Read test
+## 0 100 means 100% read  ... but fio will create the files first.
 create_input_cfg 0 100 rw.0.100.input sequential
 run rw.0.100.input
+
+##  80 / 20    read /write
+#create_input_cfg 20 80 rw.20.80.input sequential
+#run rw.20.80.input
+
+# Go count the tcp retransits during this run (useful for lossy ethernet networks)
+verify_retrans
