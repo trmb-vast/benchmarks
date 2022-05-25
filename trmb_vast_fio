@@ -1,0 +1,334 @@
+#!/bin/bash
+
+# trmb_vast_fio  -- a scaleout fio wrapper script
+
+# This benchmark script will scale up from one client to as many as you list in the PBS_NODEFILE, and run fio.
+# This script embeds the fio parameter file in this script. you can edit variables there.
+# This script also collects VAST cluster metrics. you need to setup a .ssh/vms file with credentials. see below.
+# 
+
+# Run fio under daemon mode
+# run this first
+
+# clush -g rob '/pkg/trmb/bin/fio --server  --daemonize=/tmp/fio.pid'
+
+###    rmallory Thu Sep 12 01:46:11 UTC 2019 version 0.5 .. this is still rough
+###             Tue Jun  2 00:57:54 UTC 2020 version 0.6 .. updated for multiple mounts
+###             Mon May 23 21:20:50 UTC 2022 version 0.8 .. updated for get_metrics to get VAST metrics
+#
+###
+### Notes:
+###  needs fio 3.19+  (with refill_buffers flag)   https://github.com/axboe/fio
+###  needs to be run from a trusted host who has ssh keys.
+###  needs NOT to be run as root
+###  will try to start the client daemons 
+###  we run directio in this test, random data pattern, reads dont get buffered by linux VFS buffercache.
+
+## Howto:
+##  0) go get and compile a recent version of fio if yours is not up to date.
+##  1) create your hostlist as setup below. Using multiple entries for same host will send multiple job batches to it.
+##  2) if you have multiple TESTDIRs, seperate them with :colon: and also set numjobs= to be the same as
+##     the quantity of mounts you have per host.
+##  3) craft a smart mount script, as mentioned above, and mount all TESTDIRs on each client in the PBS_NODEFILE
+##  4) the fio commandline may get over 1024 length and blow up the shell.. if so, then we can probably split
+##     up seperate PBS_NODEFILEs  and directories to test in(TESTDIR), and then run multiple instances of this.
+
+
+## Notes on VAST global write buffer:   
+# VAST utilizes about 5 or 6 TB of SCM per dbox as a write buffer.  (if you have more dboxes, then scale this)
+# this will constrict performance because the reads are coming from the QTY:12 SCM drives rather than QTY:40 QLC drives.
+# because it has not had time (actually, other data written behind it) to migrate Optane data to QLC. 
+# Note... this only occurs in synthetic testing on an otherwise idle VAST. So it should be nothing to worry about.
+# two ways to avoid this:   make your filesize=64GB  (which makes initial creation very long)
+#                           run a synthetic flush on the cnodes:  
+#           /vast/data/bashdocker.sh vtool -h 127.0.0.1 -p 5001 command 'commander.flush_all_write_buffers()'
+#
+#
+# a really good paper describing this is here:
+# http://www.pdsw.org/pdsw21/papers/ws_pdsw_paper_S2_P1_paper-lockwood.pdf
+
+
+DATE=`date +%m.%d.%Y`
+DATE_TIME=`date +%d.%m.%Y_%H.%M.%S`
+
+DEBUG=true
+
+
+FIO=/usr/bin/fio
+FIO=/pkg/trmb/bin/fio
+
+DAEMON="$FIO --server --daemonize=/tmp/fio.pid"
+
+########################################################
+## Change the next three for sure. 
+
+# Set the test number
+TESTNUM=test4
+# Set the basedir for the test
+TESTDIR="/hana/data01/${TESTNUM}"
+
+# Another example
+# Single mount example
+#export TESTDIR=/mnt/vast
+
+# You can have multiple mountpoints used like this, but be sure to match numjobs to this to distibute them.
+# ask rob about a script run on client / server to make good choices for mounts
+#export TESTDIR=/ib0/sw0/imagenet-scratch/robtest:/ib1/sw1/imagenet-scratch/robtest:/ib6/sw0/imagenet-scratch/robtest:/ib7/sw1/imagenet-scratch/robtest:/ib2/sw0/imagenet-scratch/robtest:/ib5/sw1/imagenet-scratch/robtest:/ib3/sw1/imagenet-scratch/robtest:/ib4/sw0/imagenet-scratch/robtest
+
+########################################################
+# OK.. so if we have colon-seperated testdirs, then basedir is the first
+#BASEDIR="$(echo $TESTDIR | cut -d: -f1)/vastdata/vast_fio"
+BASEDIR="$(echo $TESTDIR | cut -d: -f1)"
+
+########################################################
+# You must create/maintain a hosts file here.. 
+# it can have multiple entries for same host in it.
+
+PBS_NODEFILE="$BASEDIR/hostfile"
+test -f $PBS_NODEFILE || echo "No hostfile at: $PBS_NODEFILE"
+test -f $PBS_NODEFILE || exit
+echo "Info: using Hostfile: $PBS_NODEFILE"
+########################################################
+
+# twiddle some knobs if you like. we loop through these space seperated lists
+blocksizes="32k 64k 128k 256k 512k 768k 1m"
+blocksizes="4k 8k 16k 64k 128k 512k 1m"
+#blocksizes="256k"
+#blocksizes="1m"
+
+# This is the array of how many hosts you want to test with, incrementing or decrementing.
+# if your hostfile has only a couple hosts, but they have multiple interfaces
+# then you can put multiple entries of that host in the hostfile, and it will
+# run this many occurances of that. the value below just takes the head -n of the PBS_NODEFILE
+#qty_hosts="1 2 4 8 "
+#qty_hosts="10 12 14 16"
+#qty_hosts="8"
+##qty_hosts={1..16}
+#qty_hosts="{1..8}"
+### hardcoded below.... will debug the above later
+
+########################
+
+#Yes, we re-use this variable
+export TESTDIR=$BASEDIR/testfiles
+
+export _test=read
+export OUTDIR="$BASEDIR/$DATE"
+export OUTPUTDIR_BWLOG="$BASEDIR/$DATE/bwlog"
+test -d $OUTPUTDIR_BWLOG || mkdir -p $OUTPUTDIR_BWLOG
+
+
+for i in $(cat $PBS_NODEFILE)
+do ssh $i "test -d $TESTDIR || mkdir $TESTDIR"
+   ssh $i "test -d $OUTDIR|| mkdir $OUTDIR"
+done
+
+
+########### Functions below
+after=0
+#  tcp Retransmits  on the clients is only good for incoming write workloads
+#  we monitor tcp retrans on the VAST cluster side, in a script outside of this.
+verify_retrans() {
+   if [ "$after" -gt 0 ] ; then after=0  ;fi #Flip flop after
+   mnt=$1
+    for i in $(cat $PBS_NODEFILE);do
+            RETRANS=$(ssh $i cat /proc/net/snmp | grep -A1 Segs  | tail -1  | awk '{print $(NF-2)}')
+            TOTAL_RETRANS=$((TOTAL_RETRANS+$RETRANS))
+            echo -- checking tcp retransmissions $i = $RETRANS --
+    done
+    if [ $after -lt 1 ] ; then BEFORE_RETRANS=$TOTAL_RETRANS ; fi
+    if [ $after -eq 1 ] ; then AFTER_RETRANS=$((TOTAL_RETRANS - $BEFORE_RETRANS)) ; fi
+    after=1
+    echo "retrans:$RETRANS  total_retrans:$TOTAL_RETRANS before:$BEFORE_RETRANS after: $AFTER_RETRANS"
+}
+
+### Check for daemon already running on clients, else launch it
+daemon_fio() {
+    for i in $(cat $PBS_NODEFILE);do
+            echo -- checking for fio server daemon $i --
+            #RUNNING=$(ssh $i "ps -e -o command  | grep $DAEMON)"
+	    ssh $i "if [ -n \"$(ps -e -o command  | grep fio | grep -v grep | grep daemon)\" ] ; then : ; else $DAEMON ; fi"
+            #ssh $i "ps -e -o command  | grep fio | grep -v grep | grep daemon"
+            #ssh $i $DAEMON
+    done
+}
+
+
+
+update_bs() {
+    _fname=$1
+    _bs=$2
+
+    sed -i -e "s/BLOCK_SIZE/$_bs/" $_fname
+}
+
+reset_bs(){
+    _fname=$1
+
+    sed -i -e 's/^bs=.*/bs=BLOCK_SIZE/' $_fname
+}
+
+create_input_cfg() {
+    _write=$1
+    _read=$2
+    _fname=$3
+    _tname=$4
+
+    cat >> $_fname << EOF
+[global]
+name=fio-${_tname}-${_write}.${_read}
+bs=BLOCK_SIZE
+rw=$_test
+direct=1
+refill_buffers=1
+randrepeat=0
+time_based=1
+runtime=300
+ramp_time=20
+ioengine=libaio
+overwrite=1
+group_reporting=1
+rwmixwrite=$_write
+rwmixread=$_read
+#unlink_each_loop=1
+#unlink=1
+#sync_on_close=1
+#create_on_open=1
+#create_serialize=0
+
+[file1]
+rw=randread
+filesize=1600MB
+iodepth=16
+directory=$TESTDIR
+nrfiles=4
+numjobs=4 
+#match nconnect to nrfiles
+
+# Uncomment test2 to make the iops bi-modal, like EDA
+# adjust the params to fit so they finish at the same time or use time_based
+# ask rob for some even more interesting overlapping tests.
+#[test2]
+#directory=$TESTDIR
+#bs=4k
+#thread=4
+#size=8g
+
+EOF
+$DEBUG && cat $_fname | egrep -v '^#'
+}
+
+verify_mount() {
+    mnt=$1
+    for i in $(cat $PBS_NODEFILE);do
+            echo -- mnt verify $i --
+	    ssh $i cd $mnt
+    done
+}
+
+###################
+
+############################################
+# function to get_metrics from VAST REST api
+function get_metrics() {
+                # get the VMS creds
+                test -f $HOME/.ssh/vms || echo "you need to put VMS_IP=10.10.x.x  VMS_USER=support  VMS_PASS=xxx into $HOME/.ssh/vms , and chmod 700 it"
+                test -f $HOME/.ssh/vms && . $HOME/.ssh/vms
+                 
+
+                CLUS_JSON=/tmp/cluster_stats.json
+                rm -f $CLUS_JSON
+
+$DEBUG &&       echo "Retreiving Metrics from VMS dashboard: https://$VMS_IP/api/clusters/"
+                curl -s -u ${VMS_USER}:${VMS_PASS} -k https://${VMS_IP}/api/clusters/?fields=psnt,name,leader_cnode,sw_version,build,ssd_raid_state,nvram_raid_state,memory_raid_state,upgrade_state,rd_iops,rd_latency_ms,rd_bw_mb  >$CLUS_JSON
+                # Put all the values into upper-case base variables
+                for i in psnt name sw_version build ssd_raid_state nvram_raid_state rd_iops rd_latency_ms rd_bw_mb; do
+                        VAL=$(cat $CLUS_JSON | jq -r ".[].$i")
+                        eval VAST_$(echo "$i" | awk '{print toupper($0)}')=$VAL
+                        if [ "X$(echo $METRICS | grep VAST_$(echo $i | awk '{print toupper($0)}'))" = "X" ]; then
+                                METRICS="$METRICS VAST_$(echo $i | awk '{print toupper($0)}')"
+                        fi
+#set +x
+                done
+
+                ## Here we nuke low amount of IOPS and retry
+                #if (($VAST_RD_IOPS > 100)); then
+                if [ $VAST_RD_IOPS -gt  100 ]; then
+                        VAST_IOSIZE=$(echo "scale=2; $VAST_RD_BW_MB / $VAST_RD_IOPS" | bc -l)
+                        VAST_IOSIZE=$(echo "$VAST_IOSIZE * 1024" | bc -l | awk '{print $1}')
+                else
+                        VAST_IOSIZE=1
+                fi
+
+		echo "Info: NAME: $VAST_NAME VAST_Build: $VAST_BUILD SSD_RAID_STATE=$VAST_SSD_RAID_STATE"
+                echo "Info: VAST  IOSIZE:$VAST_IOSIZE , BW:$VAST_RD_BW_MB, RD_IOPS:$VAST_RD_IOPS RD_LATENCY_MS=$VAST_RD_LATENCY_MS"
+        }
+
+
+##################
+
+
+run () {
+    input_file=$1
+    for num_clients in {1..8} ;do
+#    for num_clients in $qty_hosts ;do
+        [[ ! -e $OUTDIR ]] && mkdir -p $OUTDIR
+        nodes=`head -$num_clients $PBS_NODEFILE`
+        for bs in $blocksizes ;do
+        #for bs in 1m ;do
+            update_bs $input_file $bs
+	    echo "Info: _____ STARTING TEST $input_file bs=$bs num_clients=$num_clients _____$(date)"
+            cmd="$FIO --output ${OUTDIR}/${input_file}.${num_clients}.${bs}.out "
+            infile=$BASEDIR/$input_file
+            for node in $nodes;do
+                cmd=$cmd" --client=$node $infile  --write_bw_log=$OUTPUTDIR_BWLOG/${input_file}.${num_clients}.${bs}.$node"
+            done #i
+            echo "CMD= $cmd"
+#            df -h $TESTDIR
+            eval $cmd
+  	    get_metrics | tee -a ${OUTDIR}/${input_file}.${num_clients}.${bs}.out
+#            df -h $TESTDIR
+#	    echo "Info: _____ ENDING   TEST $input_file bs=$bs num_clients=$num_clients _____$(date)"
+            reset_bs $input_file
+            sleep 10
+        done #bs
+done | tee $BASEDIR/${TESTNUM}.${DATE_TIME}.${NUM_CLIENTS}_clients.stdout 
+}
+
+
+# Make sure all the nodes have TESTDIR mounted
+verify_mount $TESTDIR
+verify_retrans
+daemon_fio
+
+[[ ! -e $BASEDIR ]] && echo "Error no $BASEDIR" && exit
+cd $BASEDIR
+rm *.input
+
+#  Yes, these are ass-backwards.. rw.100.0 means 100% write.
+# so technically it should be called wr.100.0  but that would be more confusing... 
+# maybe we make it rw.0.100 ... 
+#
+#echo doing 100% write
+#create_input_cfg 100 0 rw.100.0.input multi-rand
+#run rw.100.0.input
+
+#echo doing 75% write
+#create_input_cfg 75 25 rw.75.25.input multi-rand
+#run rw.75.25.input
+
+#echo doing 50percent random read
+#create_input_cfg 50 50 rw.50.50.input multi-rand
+#run rw.50.50.input multi-rand
+
+echo doing 100percent random readd
+create_input_cfg 0 100 rw.0.100.input multi-rand
+run rw.0.100.input
+
+# Do some Stats on latency in the stats dir
+#pushd /hana/data01/test4/05.22.2022/
+# the following will show the last hosts's latency.. it is not an average across all hosts.
+#for i in  rw.0.100.input.*.512k.out ; do printf "$i:\t" ; tail -24 $i | grep clat | awk '{print $5}' | tr -d ',' | grep -v '^$'; done | sort -n -t '.' -k5
+# the following will show the last host's bandwidth.. it is not an aggregate of all
+#for i in  rw.0.100.input.*.512k.out ; do printf "$i:\t" ; tail -24 $i | grep READ | awk '{print $3}' | tr -d '(|)' | tr -d ',' | grep -v '^$'; done | sort -n -t '.' -k5
+

@@ -1,0 +1,143 @@
+#!/bin/bash
+# trmb_fio_parse -- script to extract stuff from multi-host runs
+# and make a csv file to import into excel or gsheet
+#grep -A 20  'All clients' rw.0.100.input.3.1m.out
+
+HEADERPRINTED=false
+
+for REPORT in *.out
+do
+unset METRICS
+RWMIX=$(echo $REPORT | cut -d. -f2-3)
+NUMCL=$(echo $REPORT | cut -d. -f5)
+BS=$(echo $REPORT | cut -d. -f6)
+
+#echo "RWmix=$RWMIX  NUMCL=$NUMCL  BS=$BS"
+
+
+#Info: NAME: selab-phx-201 VAST_Build: release-4.2.0-sp5-627803 SSD_RAID_STATE=HEALTHY
+
+#echo "NAME=$NAME BUILD=$BUILD"
+
+###
+# Robs cool trick to turn variables read above from lowercase into upercase with some edits.
+#  grep clat from the output file from fio,  then split it into variables.
+
+if [ $(grep -A 20 'All clients' $REPORT | wc -l ) -lt 10 ]
+	then read nothing iops bw_i bw_si  nothing  <<< $(grep read: $REPORT | sed -e 's/[(|)|,]/ /g' -e 's%B/s%%g' -e 's%B/S%%g')
+             read nothing2 name1 NAME build1 BUILD nothing  <<< $(grep NAME: $REPORT | sed 's/[(|)|,]/ /g')
+             read nothing nothing2 fio_min fio_max fio_avg fio_stdev <<<$(grep 'clat' $REPORT | grep stdev | tr -d ,)
+             read nothing nothing IOSIZE BW RD_IOPS RD_LATENCY nothing  <<< $(grep IOSIZE $REPORT | tr ':' '='| sed 's/[(|)|,]/ /g')
+        else 
+	     read nothing iops bw_i bw_si  nothing  <<< $(grep -A 20 'All clients' $REPORT  | grep read: | sed -e 's/[(|)|,]/ /g' -e 's%B/s%%g' -e 's%B/S%%g')
+             read nothing2 name1 NAME build1 BUILD nothing  <<< $(grep -A 20 'All clients' $REPORT  | grep NAME: | sed 's/[(|)|,]/ /g')
+             read nothing nothing2 fio_min fio_max fio_avg fio_stdev <<<$(grep -A 20 'All clients' $REPORT | grep 'clat' | grep stdev | tr -d ,)
+             read nothing nothing IOSIZE BW RD_IOPS RD_LATENCY nothing  <<< $(grep -A 20 'All clients' $REPORT  | grep IOSIZE | tr ':' '='| sed 's/[(|)|,]/ /g')
+fi
+
+
+#numfmt: invalid suffix in input ‘2180MB/S’: ‘B/S’
+for x in iops bw_si ; do
+        VAL=$(echo ${!x} | cut -d= -f2 | awk '{print toupper($0)}' | numfmt --from=iec )
+        eval $(echo "FIO_READ_${x}" | awk '{print toupper($0)}')=$VAL
+        METRICS="$METRICS $(echo FIO_READ_${x} | awk '{print toupper($0)}')"
+done
+
+for x in fio_min fio_max fio_avg fio_stdev; do
+        VAL=$(echo ${!x} | cut -d= -f2)
+        eval $(echo "FIO_READ_CLAT_${x}" | awk '{print toupper($0)}')=$VAL
+        METRICS="$METRICS $(echo FIO_READ_CLAT_${x} | awk '{print toupper($0)}')"
+done
+
+
+for i in IOSIZE BW RD_IOPS RD_LATENCY
+do  VAL=$(echo ${!i} | awk -F= '{print $NF}')
+	eval $(echo VAST_READ_${i} | awk '{print toupper($0)}')=$VAL
+        METRICS="$METRICS $(echo VAST_READ_${i} | awk '{print toupper($0)}')"
+        
+done
+
+#echo _____________ Metrics:  $METRICS
+###
+## print out results, one per line, and also send numerics to graphite
+#echo "Metrics collected from this benchmark:"
+METRICS="NAME BUILD RWMIX NUMCL BS $METRICS"
+
+if [ "$HEADERPRINTED" = false ]
+then
+for x in $(echo $METRICS | awk '{print tolower($0)}'); do
+  printf "$x," ; done ; echo
+HEADERPRINTED=true
+fi
+
+	for x in $METRICS; do
+
+	check=$(echo "${!x}" | grep -E ^\-?[0-9]*\.?[0-9]+$)
+
+        if [ "$check" != '' ]; then
+#                # it IS numeric
+#        echo $x=${!x}
+         printf "${!x},"
+ else 
+	 if [ -n "$(echo ${x} | egrep -i 'NAME|BUILD|BS')" ]
+             then printf "${!x},"
+ fi
+#                echo "benchmarks.$HN.$(echo $x | tr '_' '.' | awk '{print tolower($0)}') ${!x} $TIMES" | $installdir/nc -w1 $GRAPHITE $GRAPHITE_PORT
+        fi
+done
+echo
+done
+
+exit
+
+
+
+#[vastdata@se-phx-cl3-c1 benchmark_results]$ ./trmb_parse
+# example output below
+RWmix=0.100  NUMCL=8  BS=64k
+NAME=selab-phx-201 BUILD=release-4.2.0-sp5-627803
+FIO_READ_IOPS=194560
+FIO_READ_BW_SI=13314398618
+FIO_READ_CLAT_FIO_MIN=224
+FIO_READ_CLAT_FIO_MAX=21593
+FIO_READ_CLAT_FIO_AVG=2688.43
+FIO_READ_CLAT_FIO_STDEV=938.76
+VAST_READ_IOSIZE=61.44
+VAST_READ_BW=12432.9
+VAST_READ_RD_IOPS=189711
+VAST_READ_RD_LATENCY=1.961
+
+
+#[vastdata@se-phx-cl3-c1 benchmark_results]$ ./trmb_parse
+#RWmix=0.100  NUMCL=8  BS=64k
+#iops=IOPS=190k  bw_i=BW=11.6Gi  bw_si=12.4G  nothing=
+#IOSIZE=IOSIZE:61.44  BW RD_IOPS=RD_IOPS:189711 RD_LATENCY=RD_LATENCY_MS=1.961
+
+
+#[vastdata@se-phx-cl3-c1 benchmark_results]$ ./trmb_parse
+#RWmix=0.100  NUMCL=8  BS=64k
+#iops=IOPS=190k  bw_i=BW=11.6Gi  bw_si=12.4G  nothing=3471GiB/300004msec
+#[vastdata@se-phx-cl3-c1 benchmark_results]$ man numfmt
+#[vastdata@se-phx-cl3-c1 benchmark_results]$ man numfmt
+#[vastdata@se-phx-cl3-c1 benchmark_results]$  echo 1K | numfmt --from=iec
+#1024
+
+
+#All clients: (groupid=0, jobs=3): err= 0: pid=0: Tue May 24 05:24:09 2022
+#  read: IOPS=17.4k, BW=17.0Gi (18.3G)(5102GiB/300012msec)
+#    slat (usec): min=44, max=1463, avg=106.68, stdev=51.79
+#    clat (usec): min=1709, max=68332, avg=10916.62, stdev=2344.35
+#     lat (usec): min=1766, max=68406, avg=11023.54, stdev=2345.07
+#   bw (  MiB/s): min=16959, max=17893, per=100.00%, avg=17418.49, stdev=12.80, samples=7200
+#   iops        : min=16958, max=17891, avg=17417.13, stdev=12.80, samples=7200
+#  lat (msec)   : 2=0.01%, 4=0.01%, 10=32.08%, 20=67.22%, 50=0.70%
+#  lat (msec)   : 100=0.01%
+#  cpu          : usr=0.58%, sys=16.00%, ctx=4552382, majf=0, minf=6405
+#  IO depths    : 1=0.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=100.0%, 32=0.0%, >=64=0.0%
+#     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+#     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.1%, 32=0.0%, 64=0.0%, >=64=0.0%
+#     issued rwts: total=5224248,0,0,0 short=0,0,0,0 dropped=0,0,0,0
+#Retreiving Metrics from VMS dashboard: https://10.71.10.201/api/clusters/
+#Info: NAME: selab-phx-201 VAST_Build: release-4.2.0-sp5-627803 SSD_RAID_STATE=HEALTHY
+#Info: VAST  IOSIZE:1064.96 , BW:18331.206, RD_IOPS:17482 RD_LATENCY_MS=3.096
+
